@@ -1,3 +1,168 @@
+# InternNav-RL
+
+Research fork of [InternRobotics/InternNav](https://github.com/InternRobotics/InternNav), investigating reinforcement learning for dynamic obstacle avoidance in DualVLN / InternVLA-N1.
+
+**Status: research planning; the RL extension is not implemented yet.** The architecture below is a proposed baseline, not a released feature. This fork does not currently provide a PPO trainer, dynamic-obstacle training environment, RL checkpoints, or experimental results for the proposed method. Existing upstream capabilities are documented separately below.
+
+The initial direction is **PPO with a learned local decision policy built on a frozen pretrained Sys1**. FPO and joint training of the original DiT are future research directions. The objective is to reduce reliance on additional expert demonstrations; online RL still requires simulator interactions and reward feedback.
+
+## Research navigation
+
+- [Research objective](#research-objective)
+- [Proposed PPO baseline](#proposed-ppo-baseline)
+- [Training and execution](#training-and-execution)
+- [Evaluation plan](#evaluation-plan)
+- [Roadmap](#roadmap)
+- [Development and code map](#development-and-code-map)
+- [Attribution and licensing](#attribution-and-licensing)
+- [Upstream InternNav documentation](#upstream-internnav-documentation)
+
+## Research objective
+
+Improve navigation around moving obstacles, especially pedestrians, while preserving instruction following and the latency advantages of the dual-system architecture. Desired behaviors include local detours, slowing down, yielding, waiting, and resuming progress after an encounter.
+
+The research will examine whether a small policy can use existing visual representations, a pretrained reference path, and robot motion information to improve these decisions. Safety, task completion, interaction cost, and inference latency must be evaluated together. No performance improvement or real-time guarantee has been established for this fork.
+
+## Proposed PPO baseline
+
+The first baseline keeps the pretrained navigation backbone frozen and learns an additional local policy using Proximal Policy Optimization (PPO).
+
+### Original DualVLN architecture
+
+![Original DualVLN architecture showing System 2 goal reasoning and System 1 trajectory generation](assets/diagrams/dualvln-original-architecture.png)
+
+*Original architecture from [DualVLN](https://arxiv.org/abs/2512.08186), preserved from the user-provided figure without modification. This figure describes the upstream model and does not include the proposed PPO extension.*
+
+### Proposed PPO extension
+
+![Proposed PPO extension: a frozen Sys1 supplies visual tokens and a base path; a trainable state encoder, fusion module, and PPO actor predict corrections and speed adjustments for MPC execution](assets/diagrams/ppo-baseline.png)
+
+*Conceptual illustration generated with ChatGPT Image for this fork; it depicts planned components, not an implemented system. The [generation prompt](assets/diagrams/ppo-baseline.prompt.txt) is included for reference.*
+
+The base path is supplied both to the PPO actor as a feature and to the execution stage as the reference to be corrected. Fused visual/state features feed the actor, not the frozen DiT. The critic and training updates are omitted for clarity.
+
+This diagram describes the planned continuous execution baseline. The existing Habitat discrete-action pipeline is a separate execution path; the training interface must be established before this architecture can be evaluated there.
+
+### State encoding and feature fusion
+
+Candidate state inputs include measured linear/angular velocity, the previous issued control command, and the time interval between observations. Inputs must be normalized, expressed in consistent units and frames, and aligned with the visual observation timestamp. Measured motion and commanded motion are distinct signals.
+
+A small MLP will encode these numerical inputs. No separately pretrained state embedding model is required. The initial fusion candidate is **FiLM**: the MLP predicts channel-wise scale and bias for the QFormer outputs. For visual token `Q_i`, the proposed residual form is:
+
+```text
+gamma, beta = StateMLP(normalized_robot_state)
+Q_fused[i] = (1 + gamma) * Q[i] + beta
+```
+
+The same channel parameters are broadcast across the 32 tokens. Zero-initializing the final modulation layer makes this transformation initially preserve the original features. Token count and feature dimension remain unchanged; the additional encoding and modulation still have a latency cost that must be measured.
+
+The 32 QFormer visual tokens are **not** the 32 predicted trajectory increments and do not have a one-to-one correspondence with them. Robot motion inputs also do not, by themselves, reveal pedestrian velocity. Whether the existing visual observations contain sufficient motion information remains an open question.
+
+FiLM is a baseline to test, not an assumed best solution. Simple concatenation, additive fusion, gating, and other fusion methods will be compared without automatically increasing the attention sequence length.
+
+### Policy, actions, and trainable modules
+
+The PPO actor will fuse visual, state, and base-path features and output a tractable stochastic action distribution. A small MLP actor with Gaussian parameters is an initial candidate; the bounded action mapping and log-probability calculation must be defined consistently. Training samples actions for exploration; evaluation will document the chosen deterministic or stochastic rule.
+
+The candidate action space is **near-term path corrections plus a speed adjustment**. The number of corrected points, correction bounds, speed parameterization, and policy update interval are not finalized. Corrections must cover the reference region actually used by the controller rather than assuming only the first path point matters.
+
+| Component | Initial training scope |
+| --- | --- |
+| Sys2 and goal-latent extraction | Frozen |
+| Sys1 visual encoder and QFormer | Frozen |
+| Original trajectory DiT and its existing projections | Frozen |
+| State encoder and feature-fusion module | Trainable |
+| PPO actor and critic | Trainable |
+| MPC | Fixed optimization algorithm; adapt its interface to accept policy outputs |
+
+The critic estimates future return from the rollout data. Actor inputs must be available at deployment; any simulator-only information used for rewards or the critic must be identified explicitly.
+
+In this baseline, fused features feed the **new PPO actor**, while the original DiT retains its original conditioning and supplies the base path. Gradients stop at the frozen backbone outputs, so training does not require backpropagation through DiT sampling. This improves the execution chain through a learned policy; it does not fine-tune the original DiT weights. Feeding modulated features back into DiT would be a different design and would still require a suitable policy-probability formulation for PPO.
+
+## Training and execution
+
+The planned rollout loop is:
+
+1. Obtain the current observation, synchronized robot state, Sys2 condition, and DiT base path.
+2. Sample a correction and speed action from the PPO actor.
+3. Apply the action through the controller for a defined short simulation interval.
+4. Record the sampled action, its log probability, actual controls, elapsed time, rewards, and next observation.
+5. Continue the encounter or navigation episode and use its returns to train the actor, fusion modules, and critic.
+
+Replanning is a transition within an episode, not an episode termination. A long reference path may be generated while only a short motion interval is executed. Later reference points can still influence MPC's first control command. Rewards should reflect actual execution and subsequent outcomes, rather than treating the entire predicted path as executed.
+
+Reward design will balance task progress and success against human/static collisions, near-collision risk, elapsed time, and abrupt changes in executed controls. Waiting must advance simulation time and remain distinct from terminating the navigation task. A collision-only objective can reward permanent stopping; excessive progress or time pressure can discourage necessary yielding. Reward definitions and weights are not finalized.
+
+The existing real-world MPC and Habitat action conversion are not interchangeable. Continuous speed control requires an appropriate simulator action interface. The existing MPC also needs explicit support for policy-controlled speed parameters; changing a Python attribute alone does not update its initialized optimization constraints.
+
+## Evaluation plan
+
+Start with repeatable local encounters such as a pedestrian crossing, an approaching pedestrian, and a narrow-passage interaction. Then evaluate complete instruction-following navigation. The dynamic simulator, collision measurements, and rollout interface are prerequisites, not currently supplied by this research extension.
+
+Initial comparisons should include:
+
+| Experiment | Purpose |
+| --- | --- |
+| Pretrained system without the added policy | Establish the inherited baseline |
+| Same execution/sampling changes, without RL | Isolate changes caused by the execution interface |
+| Frozen backbone + PPO with simple feature concatenation | Establish a basic learned-fusion baseline |
+| Frozen backbone + PPO with FiLM | Test modulation under the same observations and action space |
+
+The upstream trajectory postprocessor averages candidate paths. Any change to this behavior must be documented and evaluated separately. When defining RL actions, record the actual sampled policy action and its execution mapping; an averaged path must not be treated as one original trajectory sample.
+
+Report navigation success, human and static collision rates, completion time, path efficiency, motion smoothness, and static-navigation regression. Also report environment interactions, training wall-clock time, and end-to-end observation-to-control latency, including tail latency. Upstream model throughput is not a measured latency result for this extension.
+
+Use separate training and held-out scenes and pedestrian behaviors, multiple seeds, and comparable interaction/compute budgets. Record the upstream revision, checkpoint, dependencies, simulator version, control and policy intervals, action bounds, reward configuration, and evaluation protocol. Simulation time must advance consistently rather than depend on inference wall-clock duration.
+
+## Roadmap
+
+All items below are planned work; unchecked items are not implemented features.
+
+- [ ] Establish a reproducible pretrained baseline and profile end-to-end latency.
+- [ ] Build a dynamic-obstacle simulation and rollout interface with collision feedback.
+- [ ] Define the action space, controller interface, state synchronization, and reward specification.
+- [ ] Implement the state encoder, concatenation baseline, PPO actor, and critic.
+- [ ] Implement FiLM fusion and compare it with the concatenation baseline.
+- [ ] Evaluate local encounters, full navigation, and static-task retention.
+- [ ] Explore additive/gated modulation and fusion methods beyond modulation.
+- [ ] Explore unfreezing DiT or other backbone modules, with an explicit PPO gradient/probability formulation and training-cost analysis.
+- [ ] Investigate FPO or other RL algorithms for a suitably parameterized policy. FPO targets flow-based policies and is not a drop-in loss replacement for the Gaussian PPO actor.
+
+## Development and code map
+
+For the inherited installation, data preparation, checkpoints, and evaluation workflows, follow the [upstream getting-started documentation](https://internrobotics.github.io/user_guide/internnav/quick_start/index.html). There is no research-specific training command yet; verified commands and environment requirements will be added with the implementation.
+
+Relevant existing code:
+
+| Area | Location |
+| --- | --- |
+| Visual memory encoder, QFormer, and Sys1 projections | [`internvla_n1_arch.py`](internnav/model/basemodel/internvla_n1/internvla_n1_arch.py) |
+| Flow Matching loss and trajectory sampling | [`internvla_n1.py`](internnav/model/basemodel/internvla_n1/internvla_n1.py) |
+| Sys1 policy and action conversion entry point | [`internvla_n1_policy.py`](internnav/model/basemodel/internvla_n1/internvla_n1_policy.py) |
+| Trajectory reconstruction and candidate averaging | [`vln_utils.py`](internnav/model/utils/vln_utils.py) |
+| Real-world planning and control threads | [`http_internvla_client.py`](scripts/realworld/http_internvla_client.py) |
+| MPC implementation | [`controllers.py`](scripts/realworld/controllers.py) |
+| Habitat VLN evaluation | [`habitat_vln_evaluator.py`](internnav/habitat_extensions/vln/habitat_vln_evaluator.py) |
+
+Research discussions, reproducible bug reports, and proposed changes for this fork belong in [this fork's issues](https://github.com/yAnaM1-AnNaa/InternNav-RL/issues) and pull requests. Clearly distinguish proposed methods from implemented behavior and attach experimental settings to reported results.
+
+## Attribution and licensing
+
+This is an independent research fork, not an official InternRobotics release. The original toolbox, pretrained models, upstream demonstrations, and benchmark results are credited to their respective authors. Cite the original work using the [upstream citation entries](#-citation); this fork does not yet have a separate research publication.
+
+The code is covered by the existing [MIT License](LICENSE); retain the original copyright and permission notice. Dataset, model-weight, and third-party component licenses must be checked separately. The inherited data-license information is retained in the [upstream license section](#-license).
+
+Method references:
+
+- [DualVLN: Ground Slow, Move Fast](https://arxiv.org/abs/2512.08186)
+- [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
+- [FiLM: Visual Reasoning with a General Conditioning Layer](https://arxiv.org/abs/1709.07871)
+- [Flow Matching Policy Gradients](https://arxiv.org/abs/2507.21053) — future investigation
+
+## Upstream InternNav documentation
+
+The documentation below is inherited from [InternRobotics/InternNav](https://github.com/InternRobotics/InternNav). Its news, model downloads, demonstrations, benchmark tables, and community links describe the upstream project, not results or releases of the planned RL extension. References to "we" and "our" in this section refer to the upstream authors.
+
 <div align="center">
 
 [![demo](assets/InternNav.gif "demo")](https://www.youtube.com/watch?v=fD0F1jIax5Y)

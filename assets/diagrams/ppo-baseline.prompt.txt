@@ -1,0 +1,16 @@
+Use case: infographic-diagram.
+Asset type: a simple architecture illustration for the English GitHub README of InternNav-RL.
+Create one polished, exceptionally readable scientific schematic on a pure white background, landscape approximately 16:9, large crisp sans-serif text, restrained navy, pale blue, teal and muted amber. Flat rounded rectangles, generous whitespace, consistent thin lines and arrowheads, no photography, no 3D, no decoration, no dense inner architecture. It must remain readable at 900 px wide.
+
+Title: "Proposed PPO Extension"
+Subtitle: "Frozen navigation prior + learned local decisions"
+Small status pill: "Research plan"
+
+Organize into THREE CLEAR COLUMNS, with column headers "Frozen backbone", "Trainable policy", "Execution".
+LEFT column: one large pale-blue rounded block titled "Pretrained Sys1", with two short internal lines "Visual encoder + QFormer" and "DiT". A small input label above reads "RGB + Sys2 goal". This block has TWO outgoing arrows: "Visual tokens" to the feature fusion block at the top of the middle column, and "Base path" to the "Apply correction" block in the right column. Route the base-path arrow along a clean dedicated lower horizontal lane, then upward into Apply correction, with no ambiguous arrow crossings. A compact "Frozen" badge is inside this left block.
+
+MIDDLE column: small input text "Robot state" above a teal block titled "State MLP + FiLM". This SAME block also receives the "Visual tokens" arrow from the left column; it encodes the state and modulates the visual tokens. A single downward arrow connects this block to another teal block titled "PPO actor". A thin, clearly routed secondary branch from the base-path lane also enters the PPO actor, labeled "Path features". The PPO actor sends ONE rightward arrow labeled "Path correction + speed" into "Apply correction" in the right column. Place a small "Trainable" label beneath the middle column. Do not depict FiLM output flowing into DiT: fused tokens feed only the PPO actor.
+
+RIGHT column: vertical stack of three blocks: "Apply correction", then "MPC", then "Robot". Connect them with downward arrows. The first block must visibly receive BOTH base path from the left and correction/speed from the actor. Use warm amber for Apply correction, neutral light gray for MPC and Robot. A short footer note reads "PPO learns from executed motion and rewards." No feedback arrows are needed. Do not draw the critic, probability equations, attention internals, trajectory point grids, or extra modules.
+
+All arrow directions and labels must be unambiguous. Use compact, well-spaced words exactly as specified. Do not add claims of measured speed, success rate or completed implementation. This is a new independent illustration, not an edit of the upstream paper figure.
