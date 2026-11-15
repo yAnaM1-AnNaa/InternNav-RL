@@ -9,43 +9,12 @@ import yaml
 from flask import Flask, jsonify, request
 from PIL import Image
 from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
+from internnav.utils.instruction_task import InstructionTask as Task
 
 CAMERA_POSE = np.eye(4)
 CAMERA_INTRINSIC = np.array(
     [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 )
-
-
-class Task:
-    def __init__(self, name, config):
-        self.name = name
-        self.steps = list(config['instructions'].items())
-        self.total_time = config.get('total_time')
-        self.index = 0
-        self.deadline = None
-        self.step_deadline = None
-
-    @property
-    def completed(self):
-        return self.index == len(self.steps)
-
-    def reset(self, now):
-        self.index = 0
-        self.deadline = None if self.total_time is None else now + self.total_time
-        self.set_step_deadline(now)
-
-    def set_step_deadline(self, now):
-        if self.deadline is not None and not self.completed:
-            self.step_deadline = now + (self.deadline - now) / (len(self.steps) - self.index)
-
-    def advance(self, now):
-        self.index += 1
-        self.set_step_deadline(now)
-
-    def instruction(self):
-        name, text = self.steps[self.index]
-        parts = '、'.join(key for key, _ in self.steps)
-        return f'Task name {self.name}, contains {parts}. Now executing {self.index + 1} part ({name}), the specific instruction is {text}'
 
 
 def create_app(agent, task):
@@ -69,7 +38,7 @@ def create_app(agent, task):
         timed_out = task.step_deadline is not None and now >= task.step_deadline
         if timed_out:
             task.advance(now)
-            agent.reset()
+            agent.reset(preserve_memory=True)
 
         image = np.asarray(Image.open(request.files['image'].stream).convert('RGB'))
         depth = np.asarray(Image.open(request.files['depth'].stream).convert('I'), dtype=np.float32) / 10000.0
@@ -80,12 +49,12 @@ def create_app(agent, task):
 
         if result.output_action is not None:
             action = result.output_action
-            # A timeout and a STOP must not advance two steps on the same frame.
-            if action == [0] and not timed_out:
+            # This STOP belongs to the instruction evaluated after any timeout transition.
+            if action == [0]:
                 task.advance(time.monotonic())
                 if task.completed:
                     return jsonify(discrete_action=action, task_completed=True)
-                agent.reset()
+                agent.reset(preserve_memory=True)
             return jsonify(discrete_action=action)
 
         response = {'trajectory': result.output_trajectory.tolist()}

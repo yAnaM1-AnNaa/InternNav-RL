@@ -3,6 +3,7 @@ import gzip
 import json
 import os
 from collections import defaultdict
+from hashlib import sha256
 
 import numpy as np
 
@@ -539,8 +540,42 @@ def different_height(item):
     return different_height
 
 
+def apply_instruction_tasks(episodes, tasks):
+    """Attach YAML tasks to source episodes before converting their coordinates."""
+    if not episodes:
+        return []
+    source_episodes = {(str(item['trajectory_id']), str(item['episode_id'])): item for item in episodes}
+    selected = []
+    for order, (name, task) in enumerate(tasks.items()):
+        # Tasks without an episode selector use the first episode in this split.
+        source_key = (
+            str(task.get('trajectory_id', episodes[0]['trajectory_id'])),
+            str(task.get('episode_id', episodes[0]['episode_id'])),
+        )
+        if source_key not in source_episodes:
+            continue  # The selected episode can belong to another configured split.
+        episode = copy.deepcopy(source_episodes[source_key])
+        for field in ('scene_id', 'scan', 'start_position', 'start_rotation', 'reference_path', 'info'):
+            if field in task:
+                episode[field] = task[field]
+        episode['instruction_task'] = dict(task, name=name, order=order)
+        episode['instruction']['instruction_text'] = next(iter(task['instructions'].values()))
+        # Separate results for distinct tasks, including tasks sharing the same source episode.
+        task_id = sha256(json.dumps([name, task]).encode()).hexdigest()[:12]
+        episode['path_key'] = f"{episode['trajectory_id']}_{episode['episode_id']}_{task_id}"
+        selected.append(episode)
+    return selected
+
+
 def load_data(
-    dataset_root_dir, split, filter_same_trajectory=True, filter_stairs=True, dataset_type='mp3d', rank=0, world_size=1
+    dataset_root_dir,
+    split,
+    filter_same_trajectory=True,
+    filter_stairs=True,
+    dataset_type='mp3d',
+    rank=0,
+    world_size=1,
+    instruction_tasks=None,
 ):
     """
     Load a compressed navigation dataset split and organize episodes by scan/scene,
@@ -562,12 +597,16 @@ def load_data(
         dataset_type (str, optional): Dataset source identifier, such as "mp3d", "kujiale", or "grscene". Defaults to "mp3d".
         rank (int, optional): Distributed process rank used for slicing episodes. Defaults to 0.
         world_size (int, optional): Number of distributed ranks used for striding. Defaults to 1.
+        instruction_tasks (dict, optional): YAML tasks defining the evaluation set and its instruction steps.
 
     Returns:
         dict: Mapping from `scan` → List of filtered episode items for that scene.
     """
     with gzip.open(os.path.join(dataset_root_dir, split, f"{split}.json.gz"), 'rt', encoding='utf-8') as f:
-        data = json.load(f)['episodes'][rank::world_size]
+        data = json.load(f)['episodes']
+    if instruction_tasks is not None:
+        data = apply_instruction_tasks(data, instruction_tasks)
+    data = data[rank::world_size]
 
     if dataset_type in ['kujiale', 'grscene']:
         scenes = list(set([x['scan'] for x in data]))
@@ -602,8 +641,8 @@ def load_data(
     data = copy.deepcopy(new_data)
     new_data = defaultdict(list)
 
-    # filter_same_trajectory
-    if filter_same_trajectory:
+    # Explicit YAML tasks define the evaluation set, including tasks sharing a trajectory.
+    if filter_same_trajectory and instruction_tasks is None:
         total_count = 0
         remaining_count = 0
         trajectory_list = []
@@ -619,7 +658,7 @@ def load_data(
         data = new_data
         new_data = defaultdict(list)
 
-    if filter_stairs:
+    if filter_stairs and instruction_tasks is None:
         total_count = 0
         remaining_count = 0
         for scan, data_item in data.items():

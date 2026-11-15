@@ -1,6 +1,6 @@
 from enum import Enum
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from typing import Dict, List
 
 import numpy as np
@@ -14,6 +14,7 @@ from internnav.evaluator.utils.result_logger import ResultLogger
 from internnav.evaluator.utils.visualize_util import VisualizeUtil
 from internnav.utils import common_log_util, progress_log_multi_util
 from internnav.utils.common_log_util import common_logger as log
+from internnav.utils.instruction_task import InstructionTask
 
 
 class runner_status_code(Enum):
@@ -49,6 +50,7 @@ class VLNDistributedEvaluator(DistributedEvaluator):
 
         config.agent.model_settings.update({'env_num': self.env_num, 'proc_num': self.proc_num})
         self.robot_name = config.task.robot_name
+        self.instruction_tasks = [None] * (self.env_num * self.proc_num)
 
         super().__init__(config)
         set_seed_model(0)
@@ -125,6 +127,24 @@ class VLNDistributedEvaluator(DistributedEvaluator):
                 transformed_actions.append({'h1': {move: a}})  # discrete e.g. [3]
         return transformed_actions
 
+    def start_instruction_tasks(self, reset_infos, env_ids):
+        """Start each YAML task's budget once its environment has warmed up."""
+        for env_id in env_ids:
+            self.instruction_tasks[env_id] = None
+            info = reset_infos[env_id]
+            if info is None or 'instruction_task' not in info.data:
+                continue
+            config = info.data['instruction_task']
+            task = InstructionTask(config['name'], config)
+            task.reset(monotonic())
+            self.instruction_tasks[env_id] = task
+            log.info(f'env{env_id}: {task.instruction()}')
+
+    def reset_instruction_history(self, env_ids):
+        """Keep System 2's recurrent memory across steps of the same task."""
+        options = {'preserve_memory': True} if self.eval_config.agent.model_name == 'internvla_n1' else {}
+        self.agent.reset(env_ids, **options)
+
     def get_action(self, obs, action):
         start_time = time()
         # process obs
@@ -135,10 +155,47 @@ class VLNDistributedEvaluator(DistributedEvaluator):
         )
         obs[fake_obs_index] = self.fake_obs
         obs = self.remove_obs_attr(obs)
-        if not np.logical_and.reduce(self.runner_status == runner_status_code.WARM_UP):
+        # Update task budgets before inference so a new step receives a fresh model history.
+        completed_tasks = np.zeros(len(obs), dtype=bool)
+        reset_indices = []
+        now = monotonic()
+        for env_id, task in enumerate(self.instruction_tasks):
+            if task is None or self.runner_status[env_id] != runner_status_code.NORMAL:
+                continue
+            if task.deadline is not None and now >= task.deadline:
+                task.index = len(task.steps)
+            elif task.step_deadline is not None and now >= task.step_deadline:
+                task.advance(now)
+                reset_indices.append(env_id)
+            completed_tasks[env_id] = task.completed
+            if not task.completed:
+                obs[env_id]['instruction'] = task.instruction()
+        if reset_indices:
+            self.reset_instruction_history(reset_indices)
+
+        if np.any(~(fake_obs_index | completed_tasks)):
             action = self.agent.step(obs)
             log.info(f'now action: {len(action)}, {action}, fake_obs_index: {fake_obs_index}')
             action = self._transform_action_batch(action, self.robot_flash)
+        else:
+            action = [{self.robot_name: {'stand_still': []}} for _ in obs]
+
+        reset_indices = []
+        for env_id, task in enumerate(self.instruction_tasks):
+            if task is None or self.runner_status[env_id] != runner_status_code.NORMAL:
+                continue
+            if task.completed:
+                action[env_id] = {self.robot_name: {'stop': []}}
+            elif action[env_id] == {self.robot_name: {'stop': []}}:
+                task.advance(monotonic())
+                if not task.completed:
+                    # An intermediate STOP resets model history and preserves the robot pose.
+                    action[env_id] = {self.robot_name: {'stand_still': []}}
+                    reset_indices.append(env_id)
+                    log.info(f'env{env_id}: {task.instruction()}')
+        if reset_indices:
+            self.reset_instruction_history(reset_indices)
+
         # change warm_up
         action = np.array(action)
         action[self.runner_status == runner_status_code.WARM_UP] = {'h1': {'stand_still': []}}
@@ -193,7 +250,9 @@ class VLNDistributedEvaluator(DistributedEvaluator):
 
         finish_warmup_ls = (self.runner_status == runner_status_code.WARM_UP) & [ob['finish_action'] for ob in obs_ls]
         if np.logical_or.reduce(finish_warmup_ls):
-            self.agent.reset(np.where(finish_warmup_ls)[0].tolist())
+            reset_indices = np.where(finish_warmup_ls)[0].tolist()
+            self.agent.reset(reset_indices)
+            self.start_instruction_tasks(reset_infos, reset_indices)
             self.runner_status[finish_warmup_ls] = runner_status_code.NORMAL
             log.info(f'env{np.where(finish_warmup_ls)[0].tolist()}: states switch to NORMAL.')
         # if no need reset, return False
@@ -205,6 +264,10 @@ class VLNDistributedEvaluator(DistributedEvaluator):
             if terminated and self.runner_status[env_id] != runner_status_code.TERMINATED:
                 obs = obs_ls[env_id]
                 reset_info = reset_infos[env_id]
+                task = self.instruction_tasks[env_id]
+                if task is not None:
+                    for metric in obs['metrics'].values():
+                        metric[0]['task_name'] = task.name
                 log.info(f"{self.now_path_key(reset_info)}: {json.dumps(obs['metrics'], indent=4)}")
                 self.data_collector.save_eval_result(
                     key=self.now_path_key(reset_info),
@@ -281,6 +344,7 @@ class VLNDistributedEvaluator(DistributedEvaluator):
         log.info('start new episode!')
 
         obs = self.warm_up()
+        self.start_instruction_tasks(reset_info, range(len(reset_info)))
         self.fake_obs = obs[0][self.robot_name]
         action = [{self.robot_name: {'stand_still': []}} for _ in range(self.env_num * self.proc_num)]
         obs = self._obs_remove_robot_name(obs)
@@ -304,9 +368,12 @@ class VLNDistributedEvaluator(DistributedEvaluator):
 
             # save step obs
             if self.vis_output:
-                for ob, info, act in zip(obs, reset_info, action):
+                for env_id, (ob, info, act) in enumerate(zip(obs, reset_info, action)):
                     if info is None or 'rgb' not in ob or ob['fail_reason']:
                         continue
+                    task = self.instruction_tasks[env_id]
+                    if task is not None and not task.completed:
+                        ob['instruction'] = task.instruction()
                     self.visualize_util.save_observation(
                         trajectory_id=self.now_path_key(info), obs=ob, action=act[self.robot_name]
                     )

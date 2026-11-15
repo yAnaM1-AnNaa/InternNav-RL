@@ -46,10 +46,10 @@ class AgentClient:
 
         return response.json()['action']
 
-    def reset(self, reset_index: Optional[List] = None) -> None:
+    def reset(self, reset_index: Optional[List] = None, *, preserve_memory: bool = False) -> None:
         response = requests.post(
             url=f'{self.base_url}/agent/{self.agent_name}/reset',
-            json=ResetRequest(reset_index=reset_index).model_dump(mode='json'),
+            json=ResetRequest(reset_index=reset_index, preserve_memory=preserve_memory).model_dump(mode='json'),
             headers={'Content-Type': 'application/json'},
         )
         response.raise_for_status()

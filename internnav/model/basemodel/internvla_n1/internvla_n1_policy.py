@@ -57,6 +57,7 @@ class InternVLAN1Net(PreTrainedModel):
         self.episode_idx = 0  # S2's episode idx is different from the system's idx
         self.conversation_history = []  # Multi-turn conversation exists when looking down
         self.llm_output = ""
+        self.memory_latents = None
 
     def init_prompts(self):
         self.DEFAULT_IMAGE_TOKEN = "<image>"
@@ -85,13 +86,15 @@ class InternVLAN1Net(PreTrainedModel):
             }
         )
 
-    def reset(self):
+    def reset(self, *, preserve_memory=False):
         self.rgb_list = []
         self.depth_list = []
         self.pose_list = []
         self.episode_idx = 0
         self.conversation_history = []
         self.llm_output = ""
+        if not preserve_memory:
+            self.memory_latents = None
 
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
@@ -166,14 +169,13 @@ class InternVLAN1Net(PreTrainedModel):
 
         # 3. Model inference
         with torch.no_grad():
-            output_ids = self.model.generate(
+            generation, self.memory_latents = self.model.generate_with_latents(
                 **inputs,
+                memory_latents=self.memory_latents,
                 max_new_tokens=128,
                 do_sample=False,
-                use_cache=True,
-                past_key_values=None,
-                return_dict_in_generate=True,
-            ).sequences
+            )
+        output_ids = generation.sequences
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
         )
@@ -186,10 +188,7 @@ class InternVLAN1Net(PreTrainedModel):
             pixel_goal = [int(coord[1]), int(coord[0])]
             output.output_pixel = np.array(pixel_goal)
 
-            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-            with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
-            output.output_latent = traj_latents
+            output.output_latent = self.memory_latents
 
         else:  # Output action
             action_seq = self.parse_actions(self.llm_output)

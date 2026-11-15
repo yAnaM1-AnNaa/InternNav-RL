@@ -75,6 +75,8 @@ eval_cfg = EvalCfg(
     ),
     eval_type='vln_distributed',
     eval_settings={
+        # YAML task names and ordered instruction steps can also be supplied through --instruction_file.
+        # 'instruction_file': 'data/eval_instructions.yaml',
         'save_to_json': True,
         'vis_output': True,
         'use_agent_server': False,  # If use_agent_server=True, please start the agent server first.

@@ -22,6 +22,7 @@ class ResumablePathKeyEpisodeloader(BasePathKeyEpisodeloader):
         filter_stairs,
         rank=0,
         world_size=1,
+        instruction_tasks=None,
     ):
         # 加载所有数据
         super().__init__(
@@ -34,6 +35,7 @@ class ResumablePathKeyEpisodeloader(BasePathKeyEpisodeloader):
             filter_stairs=filter_stairs,
             rank=rank,
             world_size=world_size,
+            instruction_tasks=instruction_tasks,
         )
         self.task_name = task_name
         self.run_type = run_type

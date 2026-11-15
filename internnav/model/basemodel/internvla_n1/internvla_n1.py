@@ -79,6 +79,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_depths: Optional[torch.Tensor] = None,
         video_frame_num: Optional[torch.Tensor] = None,
         traj_poses: Optional[torch.Tensor] = None,
+        memory_latents: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -165,11 +166,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             n_traj_tokens = (input_ids == TRAJ_TOKEN_INDEX).sum().item()
             traj_idx = input_ids == TRAJ_TOKEN_INDEX
-            latent_queries = self.get_model().latent_queries.repeat(input_ids.shape[0], 1, 1)
-            H = latent_queries.shape[-1]
-            latent_queries = latent_queries.contiguous().view(-1, H)
             if n_traj_tokens != 0:
-                inputs_embeds[traj_idx] = latent_queries
+                latent_queries = memory_latents
+                if latent_queries is None:
+                    latent_queries = self.get_model().latent_queries.repeat(input_ids.shape[0], 1, 1)
+                inputs_embeds[traj_idx] = latent_queries.to(inputs_embeds).reshape(-1, inputs_embeds.shape[-1])
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -316,6 +317,53 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def prepare_inputs_for_generation(self, input_ids, *args, memory_latents=None, **kwargs):
+        model_inputs = super().prepare_inputs_for_generation(input_ids, *args, **kwargs)
+        model_inputs['memory_latents'] = memory_latents
+        return model_inputs
+
+    @torch.no_grad()
+    def generate_with_latents(self, input_ids, attention_mask=None, memory_latents=None, **kwargs):
+        """Generate text and recurrent latent tokens in the same VLM invocation.
+
+        The trailing query states summarize the prompt and previous memory during
+        prefill. Pixel coordinates are then decoded autoregressively from that context.
+        """
+        prompt_length = input_ids.shape[1]
+        num_queries = self.get_n_query()
+        query_ids = input_ids.new_full((input_ids.shape[0], num_queries), TRAJ_TOKEN_INDEX)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        attention_mask = torch.cat([attention_mask, attention_mask.new_ones(query_ids.shape)], dim=1)
+        suppressed_tokens = kwargs.pop('suppress_tokens', self.generation_config.suppress_tokens) or []
+        latent_tokens = None
+
+        def capture_prefill(module, args, output):
+            nonlocal latent_tokens
+            if latent_tokens is None:
+                # Retain only the query states from the prompt pass, without keeping all decoder layers.
+                latent_tokens = output[0][:, -num_queries:, :].detach().clone()
+
+        handle = self.get_model().register_forward_hook(capture_prefill)
+        try:
+            outputs = self.generate(
+                input_ids=torch.cat([input_ids, query_ids], dim=1),
+                attention_mask=attention_mask,
+                memory_latents=memory_latents,
+                suppress_tokens=[*suppressed_tokens, TRAJ_TOKEN_INDEX],
+                use_cache=True,
+                return_dict_in_generate=True,
+                **kwargs,
+            )
+        finally:
+            handle.remove()
+
+        # Keep the text-generation contract: callers decode after the original prompt length.
+        outputs.sequences = torch.cat(
+            [outputs.sequences[:, :prompt_length], outputs.sequences[:, prompt_length + num_queries:]], dim=1
+        )
+        return outputs, latent_tokens
 
     def generate_latents(self, input_ids, pixel_values, image_grid_thw):
         input_ids.to(self.get_model().device)

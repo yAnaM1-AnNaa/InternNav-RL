@@ -25,6 +25,7 @@ class ResultLogger:
             split_data_types=config.split_data_types,
             filter_stairs=config.filter_stairs,
             dataset_type=self.dataset_type,
+            instruction_tasks=dataset_cfg.dataset_settings.get('instruction_tasks'),
         )
 
     def get_split_map(
@@ -33,6 +34,7 @@ class ResultLogger:
         split_data_types,
         filter_stairs,
         dataset_type='mp3d',
+        instruction_tasks=None,
     ):
         split_map = {}
         for split_data_type in split_data_types:
@@ -42,13 +44,14 @@ class ResultLogger:
                 filter_same_trajectory=False,
                 filter_stairs=filter_stairs,
                 dataset_type=dataset_type,
+                instruction_tasks=instruction_tasks,
             )
             path_key_list = []
             for scan, path_list in load_data_map.items():
                 for path in path_list:
                     trajectory_id = path['trajectory_id']
                     episode_id = path['episode_id']
-                    path_key = f'{trajectory_id}_{episode_id}'
+                    path_key = path.get('path_key', f'{trajectory_id}_{episode_id}')
                     path_key_list.append(path_key)
             split_map[split_data_type] = path_key_list
         return split_map

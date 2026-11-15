@@ -63,7 +63,8 @@ class AgentServer:
 
     async def reset_agent(self, agent_name: str, request: ResetRequest):
         self._validate_agent_exists(agent_name)
-        self.agent_instances[agent_name].reset(getattr(request, 'reset_index', None))
+        options = {'preserve_memory': True} if request.preserve_memory else {}
+        self.agent_instances[agent_name].reset(request.reset_index, **options)
         return {'status': 'success'}
 
     def _validate_agent_exists(self, agent_name: str):

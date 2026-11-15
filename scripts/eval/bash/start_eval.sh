@@ -4,11 +4,16 @@ source /root/miniconda3/etc/profile.d/conda.sh
 conda activate internutopia
 
 CONFIG=scripts/eval/configs/h1_rdp_cfg.py
+EVAL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
             CONFIG="$2"
+            shift 2
+            ;;
+        --instruction_file|--task_name)
+            EVAL_ARGS+=("$1" "$2")
             shift 2
             ;;
         *)
@@ -36,14 +41,14 @@ if [ -n "$processes" ]; then
         echo "kill: $pid"
     done
 fi
-python scripts/eval/start_server.py --config $CONFIG > "$SERVER_LOG" 2>&1 &
+python scripts/eval/start_server.py --config "$CONFIG" > "$SERVER_LOG" 2>&1 &
 
 
 RETRY_LIMIT=5
 MONITOR_INTERVAL=60
 DEADLOCK_THRESHOLD=$((5 * 60))
 
-START_COMMAND="python -u scripts/eval/eval.py --config $CONFIG"
+START_COMMAND=(python -u scripts/eval/eval.py --config "$CONFIG" "${EVAL_ARGS[@]}")
 LOG_FILE="$EVAL_LOG"
 
 pid=0
@@ -53,7 +58,7 @@ retry_count=0
 
 start_process() {
     echo "Starting process..."
-    $START_COMMAND > "$LOG_FILE" 2>&1 &
+    "${START_COMMAND[@]}" > "$LOG_FILE" 2>&1 &
     pid=$!
 }
 

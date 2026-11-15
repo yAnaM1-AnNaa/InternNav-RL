@@ -84,7 +84,7 @@ class InternVLAN1Agent(Agent):
             self.fps_writer2 = imageio.get_writer(f"{self.debug_path}/fps_{self.episode_idx}_dp.mp4", fps=5)
             self.output_pixel = None
 
-    def reset(self, reset_index=None):
+    def reset(self, reset_index=None, *, preserve_memory=False):
         '''reset_index: [0]'''
         if reset_index is not None:
             self.episode_idx += 1
@@ -95,6 +95,7 @@ class InternVLAN1Agent(Agent):
             self.episode_idx = -1
 
         self.episode_step = 0
+        self.look_down = False
         self.s1_input = S1Input()
         with self.s2_input_lock:
             self.s2_input = S2Input()
@@ -110,7 +111,7 @@ class InternVLAN1Agent(Agent):
 
         # Reset s2 agent
         with self.s2_agent_lock:
-            self.policy.reset()
+            self.policy.reset(preserve_memory=preserve_memory)
 
         if self.vis_debug:
             self.fps_writer = imageio.get_writer(f"{self.debug_path}/fps_{self.episode_idx}.mp4", fps=5)

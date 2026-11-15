@@ -27,10 +27,15 @@ mode="$1"
 shift   # remove first argument so only extra args left (--config ...)
 
 CONFIG=scripts/eval/configs/h1_internvla_n1_async_cfg.py
+EVAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
             CONFIG="$2"
+            shift 2
+            ;;
+        --instruction_file|--task_name)
+            EVAL_ARGS+=("$1" "$2")
             shift 2
             ;;
         *)
@@ -48,7 +53,7 @@ case "$mode" in
         conda activate habitat
 
         python scripts/eval/eval.py \
-            --config $CONFIG
+            --config "$CONFIG" "${EVAL_ARGS[@]}"
 
         ;;
     internutopia)
@@ -57,7 +62,7 @@ case "$mode" in
         conda activate internutopia
 
         python scripts/eval/eval.py \
-            --config $CONFIG
+            --config "$CONFIG" "${EVAL_ARGS[@]}"
 
         ;;
     internutopia_vec_env)
@@ -73,7 +78,7 @@ case "$mode" in
             sleep 300s
 
             echo "[run.sh] Exec start_eval.sh..."
-            bash scripts/eval/bash/start_eval.sh --config $CONFIG
+            bash scripts/eval/bash/start_eval.sh --config "$CONFIG" "${EVAL_ARGS[@]}"
 
             sleep inf
         else

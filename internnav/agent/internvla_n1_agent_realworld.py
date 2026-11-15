@@ -76,6 +76,7 @@ class InternVLAN1AsyncAgent:
         self.llm_output = ""
         self.past_key_values = None
         self.last_s2_idx = -100
+        self.memory_latents = None
 
         # output
         self.output_action = None
@@ -84,7 +85,7 @@ class InternVLAN1AsyncAgent:
         self.pixel_goal_rgb = None
         self.pixel_goal_depth = None
 
-    def reset(self):
+    def reset(self, *, preserve_memory=False):
         self.rgb_list = []
         self.depth_list = []
         self.pose_list = []
@@ -92,6 +93,8 @@ class InternVLAN1AsyncAgent:
         self.conversation_history = []
         self.llm_output = ""
         self.past_key_values = None
+        if not preserve_memory:
+            self.memory_latents = None
 
         self.output_action = None
         self.output_latent = None
@@ -219,14 +222,11 @@ class InternVLAN1AsyncAgent:
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
         t0 = time.time()
         with torch.no_grad():
-            outputs = self.model.generate(
+            outputs, self.memory_latents = self.model.generate_with_latents(
                 **inputs,
+                memory_latents=self.memory_latents,
                 max_new_tokens=128,
                 do_sample=False,
-                # use_cache=True,
-                # past_key_values=self.past_key_values,
-                return_dict_in_generate=True,
-                # raw_input_ids=copy.deepcopy(inputs.input_ids),
             )
         output_ids = outputs.sequences
 
@@ -237,18 +237,11 @@ class InternVLAN1AsyncAgent:
         with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
-        # past_key_values is not passed to generate(), so this cache is never reused; skip it to save GPU memory.
-        # self.past_key_values = copy.deepcopy(outputs.past_key_values)
         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
         if bool(re.search(r'\d', self.llm_output)):
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
             pixel_goal = [int(coord[1]), int(coord[0])]
-            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-            pixel_values = inputs.pixel_values
-            t0 = time.time()
-            with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-                return None, traj_latents, pixel_goal
+            return None, self.memory_latents, pixel_goal
 
         else:
             action_seq = self.parse_actions(self.llm_output)

@@ -1,7 +1,9 @@
 import argparse
 import importlib.util
 import sys
+from pathlib import Path
 
+import yaml
 from real_world_env import RealWorldEnv
 from stream import run, set_instruction
 
@@ -17,12 +19,14 @@ def parse_args():
         help='eval config file path, e.g. scripts/eval/configs/h1_cma_cfg.py',
     )
     parser.add_argument(
-        "--instruction",
-        type=str,
-        default='Go straight and pass the sofa and turn right into the hallway. Keep walking down, pass the kitchen and the bathroom, then enter the study room at the far end on the right with a desk, stop next to the white shelf.',
-        help='current instruction to follow',
+        "--instruction_file",
+        type=Path,
+        default=Path(__file__).resolve().parents[4] / "data" / "eval_instructions.yaml",
+        help="YAML file with tasks and instructions",
     )
+    parser.add_argument("--task_name", type=str, default=None, help="only run this task")
     parser.add_argument("--uninteractive_mode", action='store_true', help="whether to confirm each step")
+    parser.add_argument("--max_steps", type=int, default=200, help="max steps per instruction")
     return parser.parse_args()
 
 
@@ -47,20 +51,15 @@ def confirm(msg: str) -> bool:
     return answer in ("", "y")
 
 
-def get_instruction() -> int:
-    try:
-        import json
-
-        instruction_lst = json.load(open("challenge/onsite_competition/instructions.json"))
-        print("Available instructions:")
-        for i, item in enumerate(instruction_lst):
-            print(f"{i}: {item['instruction_title']}")
-        answer = input("input instruction id: ").strip().lower()
-        answer = int(answer)
-    except (EOFError, KeyboardInterrupt):
-        print("\nCancelled.")
-        sys.exit()
-    return instruction_lst[answer]['instruction'][0]
+def load_instructions(path, task_name=None):
+    tasks = yaml.safe_load(Path(path).read_text(encoding='utf-8')) or {}
+    if task_name is not None:
+        if task_name not in tasks:
+            sys.exit(f"unknown task {task_name!r}; available: {', '.join(tasks)}")
+        tasks = {task_name: tasks[task_name]}
+    for name, task in tasks.items():
+        for step_name, text in task['instructions'].items():
+            yield f'{name}/{step_name}', text
 
 
 def action_to_word(action: int) -> str:
@@ -82,36 +81,31 @@ def main():
     env = RealWorldEnv(fps=30, duration=0.1, distance=0.3, angle=15, move_speed=0.5, turn_speed=0.5)
     env.reverse()  # reverse move direction if using a rear camera
     env.step(0)
-    obs = env.get_observation()
 
     # start stream
     print("--- start running steam app ---")
     run(env=env)
 
-    while True:
-        instruction = get_instruction()
-        print("\nNew instruction:", instruction)
+    for label, instruction in load_instructions(args.instruction_file, args.task_name):
+        print(f"\nNew instruction [{label}]:", instruction)
         set_instruction(instruction)
+        agent.reset()
 
-        while True:
-            # print("get observation...")
+        for _ in range(args.max_steps):
             # obs contains {rgb, depth, instruction}
             obs = env.get_observation()
-            # print(obs)
             obs["instruction"] = instruction
 
-            print("agent step...")
-            # action is a integer in [0, 3], agent return [{'action': [int], 'ideal_flag': bool}] (same to internvla_n1 agent)
+            # action is an integer in [0, 3]; 0 means STOP/stand still.
             action = agent.step([obs])[0]['action'][0]
             print("agent step success, action:", action)
 
             if args.uninteractive_mode or confirm(f"Execute this action [{action_to_word(action)}]?"):
-                print("env step...")
                 env.step(action)
-                print("env step success")
+                if action == 0:
+                    break
             else:
                 print("Stop requested. Exiting loop.")
-                print("agent reset...")
                 agent.reset()
                 break
 
