@@ -2,112 +2,128 @@ import argparse
 import json
 import os
 import time
-from datetime import datetime
+from pathlib import Path
 
 import numpy as np
+import yaml
 from flask import Flask, jsonify, request
 from PIL import Image
-
 from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
 
-app = Flask(__name__)   # create http application
-idx = 0
-start_time = time.time()
-output_dir = ''
+CAMERA_POSE = np.eye(4)
+CAMERA_INTRINSIC = np.array(
+    [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+)
 
 
-# enroll infer port
-@app.route("/eval_dual", methods=['POST'])
-def eval_dual():
-    global idx, output_dir, start_time
-    start_time = time.time()
+class Task:
+    def __init__(self, name, config):
+        self.name = name
+        self.steps = list(config['instructions'].items())
+        self.total_time = config.get('total_time')
+        self.index = 0
+        self.deadline = None
+        self.step_deadline = None
 
-    # get robot data
-    image_file = request.files['image']
-    depth_file = request.files['depth']
-    json_data = request.form['json']
-    data = json.loads(json_data)
+    @property
+    def completed(self):
+        return self.index == len(self.steps)
 
-    image = Image.open(image_file.stream)
-    image = image.convert('RGB')
-    image = np.asarray(image)
+    def reset(self, now):
+        self.index = 0
+        self.deadline = None if self.total_time is None else now + self.total_time
+        self.set_step_deadline(now)
 
-    depth = Image.open(depth_file.stream)
-    depth = depth.convert('I')
-    depth = np.asarray(depth)
-    depth = depth.astype(np.float32) / 10000.0
-    print(f"read http data cost {time.time() - start_time}")
+    def set_step_deadline(self, now):
+        if self.deadline is not None and not self.completed:
+            self.step_deadline = now + (self.deadline - now) / (len(self.steps) - self.index)
 
-    camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "Turn around and walk out of this office. Turn towards your slight right at the chair. Move forward to the walkway and go near the red bin. You can see an open door on your right side, go inside the open door. Stop at the computer monitor"
-    policy_init = data['reset']
-    if policy_init:
-        start_time = time.time()
-        idx = 0
-        output_dir = 'output/runs' + datetime.now().strftime('%m-%d-%H%M')
-        os.makedirs(output_dir, exist_ok=True)
-        print("init reset model!!!")
-        agent.reset()
+    def advance(self, now):
+        self.index += 1
+        self.set_step_deadline(now)
 
-    idx += 1
+    def instruction(self):
+        name, text = self.steps[self.index]
+        parts = '、'.join(key for key, _ in self.steps)
+        return f'Task name {self.name}, contains {parts}. Now executing {self.index + 1} part ({name}), the specific instruction is {text}'
 
-    look_down = False
-    t0 = time.time()
-    dual_sys_output = {}
 
-    dual_sys_output = agent.step(
-        image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
-    )
-    if dual_sys_output.output_action is not None and dual_sys_output.output_action == [5]:
-        look_down = True
-        dual_sys_output = agent.step(
-            image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
-        )
+def create_app(agent, task):
+    app = Flask(__name__)
+    started = False
 
-    json_output = {}
-    if dual_sys_output.output_action is not None:
-        json_output['discrete_action'] = dual_sys_output.output_action
-    else:
-        json_output['trajectory'] = dual_sys_output.output_trajectory.tolist()
-        if dual_sys_output.output_pixel is not None:
-            json_output['pixel_goal'] = dual_sys_output.output_pixel
+    @app.route('/eval_dual', methods=['POST'])
+    def eval_dual():
+        nonlocal started
+        now = time.monotonic()
+        if json.loads(request.form['json'])['reset'] or not started:
+            task.reset(now)
+            agent.reset()
+            started = True
 
-    t1 = time.time()
-    generate_time = t1 - t0
-    print(f"dual sys step {generate_time}")
-    print(f"json_output {json_output}")
-    return jsonify(json_output)
+        if task.deadline is not None and now >= task.deadline:
+            task.index = len(task.steps)
+        if task.completed:
+            return jsonify(discrete_action=[0], task_completed=True)
+
+        timed_out = task.step_deadline is not None and now >= task.step_deadline
+        if timed_out:
+            task.advance(now)
+            agent.reset()
+
+        image = np.asarray(Image.open(request.files['image'].stream).convert('RGB'))
+        depth = np.asarray(Image.open(request.files['depth'].stream).convert('I'), dtype=np.float32) / 10000.0
+        inputs = (image, depth, CAMERA_POSE, task.instruction(), CAMERA_INTRINSIC)
+        result = agent.step(*inputs)
+        if result.output_action == [5]:
+            result = agent.step(*inputs, look_down=True)
+
+        if result.output_action is not None:
+            action = result.output_action
+            # A timeout and a STOP must not advance two steps on the same frame.
+            if action == [0] and not timed_out:
+                task.advance(time.monotonic())
+                if task.completed:
+                    return jsonify(discrete_action=action, task_completed=True)
+                agent.reset()
+            return jsonify(discrete_action=action)
+
+        response = {'trajectory': result.output_trajectory.tolist()}
+        if result.output_pixel is not None:
+            response['pixel_goal'] = result.output_pixel
+        return jsonify(response)
+
+    return app
+
+
+def main():
+    # If the task keep interrupt, larger task time in the yaml file.
+    parser = argparse.ArgumentParser()
+    cache = Path(os.environ.get('MODELSCOPE_CACHE', 'checkpoints'))
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--model_path', default=str(cache / 'InternVLA-N1'))
+    parser.add_argument('--resize_w', type=int, default=384)
+    parser.add_argument('--resize_h', type=int, default=384)
+    parser.add_argument('--num_history', type=int, default=8)
+    parser.add_argument('--plan_step_gap', type=int, default=4)
+    parser.add_argument('--port', type=int, default=5801)
+    parser.add_argument('--instruction_file', type=Path, default=Path(__file__).resolve().parents[2] / 'deploy/instructions.yaml')
+    parser.add_argument('--task_name', help='Task in the YAML; defaults to the first one')
+    args = parser.parse_args()
+
+    tasks = yaml.safe_load(args.instruction_file.read_text(encoding='utf-8'))
+    name = args.task_name or next(iter(tasks))
+    if not tasks:
+        parser.error(f'no tasks in {args.instruction_file}')
+    if name not in tasks:
+        parser.error(f'unknown task {name!r}; choose from: {", ".join(tasks)}')
+
+    task = Task(name, tasks[name])
+    print(f'Loaded task {name!r} ({len(task.steps)} steps)')
+
+    # One agent and one task state are shared by the route.
+    create_app(InternVLAN1AsyncAgent(args), task).run(host='0.0.0.0', port=args.port, threaded=False)
 
 
 if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser()
-    modelscope_cache = os.environ["MODELSCOPE_CACHE"]
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--model_path", type=str, default="{modelscope_cache}/InternVLA-N1")
-    parser.add_argument("--resize_w", type=int, default=384)
-    parser.add_argument("--resize_h", type=int, default=384)
-    parser.add_argument("--num_history", type=int, default=8)
-    parser.add_argument("--plan_step_gap", type=int, default=4) # larger setp_gap, lower VLM frequency
-    parser.add_argument("--port", type=int, default=5801)
-    args = parser.parse_args()
-
-    args.camera_intrinsic = np.array(
-        [[386.5, 0.0, 328.9, 0.0], 
-         [0.0, 386.5, 244, 0.0], 
-         [0.0, 0.0, 1.0, 0.0], 
-         [0.0, 0.0, 0.0, 1.0]]
-    )
-
-    # create the agent
-    agent = InternVLAN1AsyncAgent(args)
-    # use an all zero map to warmup the model, then reset
-    agent.step(
-        np.zeros((480, 640, 3)),
-        np.zeros((480, 640)),
-        np.eye(4),
-        "hello",
-    )
-    agent.reset()
-
-    app.run(host='0.0.0.0', port=args.port)
+    main()

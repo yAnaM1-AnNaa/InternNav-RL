@@ -9,7 +9,7 @@
 + [ ] Build new Isaac Sim playground, with moving obstacles
 + [ ] Train the RL policy in new env
 + [ ] Eval in Isaac Sim
-+ [ ] Deploy in real world
++ [ ] Deploy in real world(platform: GO2)
 + [ ] *optional* modify InternNav-deploy and deploy the model on Agile Bunker.
 
 ## What's new
