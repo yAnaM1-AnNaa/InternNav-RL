@@ -39,23 +39,20 @@ def create_app(agent, task):
         if timed_out:
             task.advance(now)
             agent.reset(preserve_memory=True)
+            if task.completed:
+                return jsonify(discrete_action=[0], task_completed=True)
 
         image = np.asarray(Image.open(request.files['image'].stream).convert('RGB'))
         depth = np.asarray(Image.open(request.files['depth'].stream).convert('I'), dtype=np.float32) / 10000.0
         inputs = (image, depth, CAMERA_POSE, task.instruction(), CAMERA_INTRINSIC)
         result = agent.step(*inputs)
-        if result.output_action == [5]:
-            result = agent.step(*inputs, look_down=True)
-
-        if result.output_action is not None:
-            action = result.output_action
+        if result.output_action == [0]:
             # This STOP belongs to the instruction evaluated after any timeout transition.
-            if action == [0]:
-                task.advance(time.monotonic())
-                if task.completed:
-                    return jsonify(discrete_action=action, task_completed=True)
-                agent.reset(preserve_memory=True)
-            return jsonify(discrete_action=action)
+            task.advance(time.monotonic())
+            if task.completed:
+                return jsonify(discrete_action=[0], task_completed=True)
+            agent.reset(preserve_memory=True)
+            return jsonify(discrete_action=[0])
 
         response = {'trajectory': result.output_trajectory.tolist()}
         if result.output_pixel is not None:

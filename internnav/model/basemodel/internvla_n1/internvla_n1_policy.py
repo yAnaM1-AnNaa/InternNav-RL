@@ -1,6 +1,7 @@
 import copy
 import itertools
 import re
+import threading
 from collections import OrderedDict
 from typing import Union
 
@@ -57,6 +58,7 @@ class InternVLAN1Net(PreTrainedModel):
         self.episode_idx = 0  # S2's episode idx is different from the system's idx
         self.conversation_history = []  # Multi-turn conversation exists when looking down
         self.llm_output = ""
+        self._history_lock = threading.RLock()
         self.memory_latents = None
 
     def init_prompts(self):
@@ -105,12 +107,13 @@ class InternVLAN1Net(PreTrainedModel):
         return list(actions)
 
     def step_no_infer(self, rgb, depth, pose):
-        image = Image.fromarray(rgb).convert('RGB')
-        image = image.resize((self.resize_w, self.resize_h))
-        self.rgb_list.append(image)
-        self.episode_idx += 1
+        with self._history_lock:
+            image = Image.fromarray(rgb).convert('RGB')
+            image = image.resize((self.resize_w, self.resize_h))
+            self.rgb_list.append(image)
+            self.episode_idx += 1
 
-    def s2_step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
+    def _prepare_s2_inputs(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
         # Need to be careful: look_down images are not added to rgb_list and won't be selected as history
         # 1. Preprocess input
         image = Image.fromarray(rgb).convert('RGB')
@@ -167,6 +170,12 @@ class InternVLAN1Net(PreTrainedModel):
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
 
+        return inputs
+
+    def s2_step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
+        with self._history_lock:
+            inputs = self._prepare_s2_inputs(rgb, depth, pose, instruction, intrinsic, look_down)
+
         # 3. Model inference
         with torch.no_grad():
             generation, self.memory_latents = self.model.generate_with_latents(
@@ -182,18 +191,13 @@ class InternVLAN1Net(PreTrainedModel):
         print(f"============ output {self.episode_idx}  {self.llm_output}")
         output = S2Output()
 
-        # 4. Post-process results
-        if bool(re.search(r'\d', self.llm_output)):  # Output pixel goal
-            coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
-            pixel_goal = [int(coord[1]), int(coord[0])]
-            output.output_pixel = np.array(pixel_goal)
-
+        if re.fullmatch(r'\s*STOP[.!。！]?\s*', self.llm_output, flags=re.IGNORECASE):
+            output.output_action = [0]
+        else:
             output.output_latent = self.memory_latents
-
-        else:  # Output action
-            action_seq = self.parse_actions(self.llm_output)
-            output.output_action = action_seq
-
+            coordinates = re.fullmatch(r'\s*(\d+)\s+(\d+)\s*', self.llm_output)
+            if coordinates:
+                output.output_pixel = np.array([int(coordinates[2]), int(coordinates[1])])
         return output
 
     def s1_step_latent(self, rgb, depth, latent):

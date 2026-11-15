@@ -3,7 +3,9 @@ import itertools
 import os
 import re
 import sys
+import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -19,12 +21,17 @@ from transformers import AutoProcessor
 
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
+from internnav.utils.latent_planner import LatestLatentPlanner
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 
 
 class InternVLAN1AsyncAgent:
     def __init__(self, args):
+        self._planner = LatestLatentPlanner()
+        self._step_lock = threading.Lock()
+        self._history_lock = threading.RLock()
+        self._observation_idx = 0
         self.device = torch.device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"args.model_path: {args.model_path}")
@@ -75,7 +82,7 @@ class InternVLAN1AsyncAgent:
         self.conversation_history = []
         self.llm_output = ""
         self.past_key_values = None
-        self.last_s2_idx = -100
+        self.last_s2_idx = float('-inf')
         self.memory_latents = None
 
         # output
@@ -86,6 +93,13 @@ class InternVLAN1AsyncAgent:
         self.pixel_goal_depth = None
 
     def reset(self, *, preserve_memory=False):
+        with self._step_lock:
+            self._planner.reset()
+            self._reset_state(preserve_memory=preserve_memory)
+
+    def _reset_state(self, *, preserve_memory=False):
+        self._observation_idx = 0
+        self.last_s2_idx = float('-inf')
         self.rgb_list = []
         self.depth_list = []
         self.pose_list = []
@@ -114,6 +128,10 @@ class InternVLAN1AsyncAgent:
         return list(actions)
 
     def step_no_infer(self, rgb, depth, pose):
+        with self._history_lock:
+            self._record_observation(rgb)
+
+    def _record_observation(self, rgb):
         image = Image.fromarray(rgb).convert('RGB')
         image = image.resize((self.resize_w, self.resize_h))
         self.rgb_list.append(image)
@@ -127,47 +145,82 @@ class InternVLAN1AsyncAgent:
         angular_vel = np.clip(angular_vel, -0.5, 0.5)
         return linear_vel, angular_vel
 
-    # 一次 HTTP 请求内的调度入口
+    def _infer_plan(self, rgb, depth, pose, instruction, intrinsic, look_down):
+        # Separate CUDA streams allow the independent S1/S2 paths to overlap.
+        stream = torch.cuda.Stream(device=self.device) if self.device.type == 'cuda' else None
+        if stream is not None:
+            stream.wait_stream(torch.cuda.default_stream(self.device))
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            try:
+                action, latent, pixel = self.step_s2(rgb, depth, pose, instruction, intrinsic, look_down)
+            finally:
+                if stream is not None:
+                    stream.synchronize()
+        return S2Output(
+            output_action=action,
+            output_latent=latent,
+            output_pixel=pixel,
+            rgb_memory=rgb,
+            depth_memory=depth,
+        )
+
     def step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
-        dual_sys_output = S2Output()
-        no_output_flag = self.output_action is None and self.output_latent is None
-        if (self.episode_idx - self.last_s2_idx > self.PLAN_STEP_GAP) or look_down or no_output_flag:
-            self.output_action, self.output_latent, self.output_pixel = self.step_s2(
-                rgb, depth, pose, instruction, intrinsic, look_down
+        # HTTP callers and instruction resets must not overlap S1 invocations.
+        with self._step_lock:
+            return self._step(rgb, depth, pose, instruction, intrinsic, look_down)
+
+    def _step(self, rgb, depth, pose, instruction, intrinsic, look_down):
+        self._observation_idx += 1
+        due = self._observation_idx - self.last_s2_idx > self.PLAN_STEP_GAP
+        submitted = False
+        if due or look_down:
+            submitted = self._planner.submit(
+                self._infer_plan,
+                rgb.copy(),
+                depth.copy(),
+                copy.deepcopy(pose),
+                instruction,
+                copy.deepcopy(intrinsic),
+                look_down,
             )
-            self.last_s2_idx = self.episode_idx
-            dual_sys_output.output_pixel = self.output_pixel
-            self.pixel_goal_rgb = copy.deepcopy(rgb)
-            self.pixel_goal_depth = copy.deepcopy(depth)
-        else:
+            if submitted:
+                self.last_s2_idx = self._observation_idx
+        if not submitted:
             self.step_no_infer(rgb, depth, pose)
 
-        if self.output_action is not None:
-            dual_sys_output.output_action = copy.deepcopy(self.output_action)
-            self.output_action = None
-        elif self.output_latent is not None:
-            processed_pixel_rgb = np.array(Image.fromarray(self.pixel_goal_rgb).resize((224, 224))) / 255
-            processed_pixel_depth = np.array(Image.fromarray(self.pixel_goal_depth).resize((224, 224)))
-            processed_rgb = np.array(Image.fromarray(rgb).resize((224, 224))) / 255
-            processed_depth = np.array(Image.fromarray(depth).resize((224, 224)))
-            rgbs = (
-                torch.stack([torch.from_numpy(processed_pixel_rgb), torch.from_numpy(processed_rgb)])
-                .unsqueeze(0)
-                .to(self.device)
-            )
-            depths = (
-                torch.stack([torch.from_numpy(processed_pixel_depth), torch.from_numpy(processed_depth)])
-                .unsqueeze(0)
-                .unsqueeze(-1)
-                .to(self.device)
-            )
-            trajectories = self.step_s1(self.output_latent, rgbs, depths)
+        try:
+            generation, plan = self._planner.take()
+        except RuntimeError:
+            self.last_s2_idx = float('-inf')
+            raise
+        if plan is None:
+            return S2Output(output_action=[0])
 
-            dual_sys_output.output_trajectory = traj_to_actions(trajectories, use_discrate_action=False)
+        # Keep this complete plan snapshot until this S1 inference has finished.
+        processed_pixel_rgb = np.array(Image.fromarray(plan.rgb_memory).resize((224, 224))) / 255
+        processed_pixel_depth = np.array(Image.fromarray(plan.depth_memory).resize((224, 224)))
+        processed_rgb = np.array(Image.fromarray(rgb).resize((224, 224))) / 255
+        processed_depth = np.array(Image.fromarray(depth).resize((224, 224)))
+        rgbs = (
+            torch.stack([torch.from_numpy(processed_pixel_rgb), torch.from_numpy(processed_rgb)])
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        depths = (
+            torch.stack([torch.from_numpy(processed_pixel_depth), torch.from_numpy(processed_depth)])
+            .unsqueeze(0)
+            .unsqueeze(-1)
+            .to(self.device)
+        )
+        with torch.no_grad():
+            trajectories = self.step_s1(plan.output_latent, rgbs, depths)
+            trajectory = traj_to_actions(trajectories, use_discrate_action=False)
+        # STOP received during S1 takes priority over its now-obsolete trajectory.
+        if not self._planner.is_current(generation):
+            return S2Output(output_action=[0])
+        return S2Output(output_trajectory=trajectory, output_pixel=plan.output_pixel)
 
-        return dual_sys_output
-
-    def step_s2(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
+    def _prepare_s2_inputs(self, rgb, depth, pose, instruction, intrinsic, look_down):
         image = Image.fromarray(rgb).convert('RGB')
         if not look_down:
             image = image.resize((self.resize_w, self.resize_h))
@@ -220,6 +273,11 @@ class InternVLAN1AsyncAgent:
         text = self.processor.apply_chat_template(self.conversation_history, tokenize=False, add_generation_prompt=True)
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
+        return inputs, self.episode_idx
+
+    def step_s2(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
+        with self._history_lock:
+            inputs, inference_idx = self._prepare_s2_inputs(rgb, depth, pose, instruction, intrinsic, look_down)
         t0 = time.time()
         with torch.no_grad():
             outputs, self.memory_latents = self.model.generate_with_latents(
@@ -234,18 +292,18 @@ class InternVLAN1AsyncAgent:
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
         )
-        with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
+        with open(f"{self.save_dir}/llm_output_{inference_idx: 04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
-        print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
-        if bool(re.search(r'\d', self.llm_output)):
-            coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
-            pixel_goal = [int(coord[1]), int(coord[0])]
-            return None, self.memory_latents, pixel_goal
-
-        else:
-            action_seq = self.parse_actions(self.llm_output)
-            return action_seq, None, None
+        print(f"output {inference_idx}  {self.llm_output} cost: {t1 - t0}s")
+        if re.fullmatch(r'\s*STOP[.!。！]?\s*', self.llm_output, flags=re.IGNORECASE):
+            return [0], None, None
+        # Coordinates remain diagnostic output; every non-STOP reply supplies a plan.
+        coordinates = re.fullmatch(r'\s*(\d+)\s+(\d+)\s*', self.llm_output)
+        pixel_goal = None
+        if coordinates:
+            pixel_goal = [int(coordinates[2]), int(coordinates[1])]
+        return None, self.memory_latents, pixel_goal
 
     def step_s1(self, latent, rgb, depth):
         all_trajs = self.model.generate_traj(latent, rgb, depth)
