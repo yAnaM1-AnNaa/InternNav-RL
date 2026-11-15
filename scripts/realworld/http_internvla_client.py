@@ -61,6 +61,7 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
     }
     start = time.time()
     response = requests.post(url, files=files, data={'json': json_data}, timeout=100)
+    response.raise_for_status()
     print(f"response {response.text}")
     http_idx += 1
     if http_idx == 0:
@@ -74,13 +75,21 @@ def control_thread():
     global desired_v, desired_w
     while True:
         global current_control_mode
+        if not manager.control_data_is_fresh():
+            desired_v, desired_w = 0.0, 0.0
+            manager.move(0.0, 0.0, 0.0)
+            time.sleep(0.1)
+            continue
         if current_control_mode == ControlMode.MPC_Mode:
             odom_rw_lock.acquire_read()
             odom = manager.odom.copy() if manager.odom else None
             odom_rw_lock.release_read()
             if mpc is not None and manager is not None and odom is not None:
-                local_mpc = mpc
-                opt_u_controls, opt_x_states = local_mpc.solve(np.array(odom))
+                mpc_rw_lock.acquire_read()
+                try:
+                    opt_u_controls, _ = mpc.solve(np.array(odom))
+                finally:
+                    mpc_rw_lock.release_read()
                 v, w = opt_u_controls[0, 0], opt_u_controls[0, 1]
 
                 desired_v, desired_w = v, w
@@ -144,12 +153,25 @@ def planning_thread():
             }
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
-            response = dual_sys_eval(rgb_bytes, depth_bytes, None)
+            request_started_at = time.monotonic()
+            try:
+                response = dual_sys_eval(rgb_bytes, depth_bytes, None, url=manager.server_url)
+            except (requests.RequestException, ValueError) as error:
+                manager.last_plan_at = None
+                manager.get_logger().error(f"Inference request failed: {error}")
+                time.sleep(0.1)
+                continue
 
             global current_control_mode
             traj_len = 0.0
-            if 'trajectory' in response:
-                trajectory = response['trajectory']
+            if not isinstance(response, dict):
+                manager.last_plan_at = None
+            elif 'trajectory' in response:
+                trajectory = response['trajectory'] # in robot coordinate
+                if not isinstance(trajectory, list) or len(trajectory) < 5:
+                    manager.last_plan_at = None
+                    manager.get_logger().warning("Inference returned too few trajectory points for MPC")
+                    continue
                 trajs_in_world = []
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
@@ -166,7 +188,7 @@ def planning_thread():
                             [0.0, 0.0, 1.0, 0],
                             [0.0, 0.0, 0.0, 1.0],
                         ]
-                    )
+                    ) # coordinate world to body
                     w_P = (w_T_b @ (np.array([traj[0], traj[1], 0.0, 1.0])).T)[:2]
                     trajs_in_world.append(w_P)
                 trajs_in_world = np.array(trajs_in_world)
@@ -175,18 +197,27 @@ def planning_thread():
                 manager.last_trajs_in_world = trajs_in_world
                 mpc_rw_lock.acquire_write()
                 global mpc
-                if mpc is None:
-                    mpc = Mpc_controller(np.array(trajs_in_world))
-                else:
-                    mpc.update_ref_traj(np.array(trajs_in_world))
-                manager.request_cnt += 1
-                mpc_rw_lock.release_write()
+                try:
+                    if mpc is None:
+                        mpc = Mpc_controller(trajs_in_world)
+                    else:
+                        mpc.update_ref_traj(trajs_in_world)
+                    manager.request_cnt += 1
+                finally:
+                    mpc_rw_lock.release_write()
                 current_control_mode = ControlMode.MPC_Mode
+                manager.last_plan_at = request_started_at
             elif 'discrete_action' in response:
                 actions = response['discrete_action']
-                if actions != [5] and actions != [9]:
+                valid_actions = isinstance(actions, list) and actions and all(action in (0, 1, 2, 3) for action in actions)
+                if valid_actions and not (manager.max_data_age > 0.0 and actions == [0]):
                     manager.incremental_change_goal(actions)
                     current_control_mode = ControlMode.PID_Mode
+                    manager.last_plan_at = request_started_at
+                else:
+                    manager.last_plan_at = None
+            else:
+                manager.last_plan_at = None
         else:
             print(
                 f"skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}"
@@ -196,15 +227,23 @@ def planning_thread():
         time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
 
 
-class Go2Manager(Node):
+class NavigationClient(Node):
     def __init__(self):
-        super().__init__('go2_manager')
+        super().__init__('navigation_client')
+        self.server_url = self.declare_parameter('server_url', 'http://127.0.0.1:5801/eval_dual').value
+        self.max_data_age = self.declare_parameter('max_data_age', 0.0).value
+        if not math.isfinite(self.max_data_age) or self.max_data_age < 0.0:
+            raise ValueError('max_data_age must be finite and non-negative (0 disables it)')
+        self.last_rgbd_at = None
+        self.last_odom_at = None
+        self.last_plan_at = None
 
         rgb_down_sub = Subscriber(self, Image, "/camera/camera/color/image_raw")
         depth_down_sub = Subscriber(self, Image, "/camera/camera/aligned_depth_to_color/image_raw")
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
+        # match the rgb and depth img
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
         self.odom_sub = self.create_subscription(Odometry, "/odom_bridge", self.odom_callback, qos_profile)
@@ -251,6 +290,7 @@ class Go2Manager(Node):
         self.new_image_arrived = True
 
     def rgb_depth_down_callback(self, rgb_msg, depth_msg):
+        # rgb -> jpeg
         raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
         self.rgb_image = raw_image
         image = PIL_Image.fromarray(self.rgb_image)
@@ -258,6 +298,7 @@ class Go2Manager(Node):
         image.save(image_bytes, format='JPEG')
         image_bytes.seek(0)
 
+        # depth -> png
         raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
         raw_depth[np.isnan(raw_depth)] = 0
         raw_depth[np.isinf(raw_depth)] = 0
@@ -282,6 +323,7 @@ class Go2Manager(Node):
 
         rgb_depth_rw_lock.release_write()
 
+        self.last_rgbd_at = time.monotonic()
         self.new_vis_image_arrived = True
         self.new_image_arrived = True
 
@@ -306,6 +348,7 @@ class Go2Manager(Node):
 
         if self.odom_cnt == 1:
             self.homo_goal = self.homo_odom.copy()
+        self.last_odom_at = time.monotonic()
 
     def incremental_change_goal(self, actions):
         if self.homo_goal is None:
@@ -332,7 +375,18 @@ class Go2Manager(Node):
                 homo_goal[:3, :3] = np.dot(rotation_matrix, homo_goal[:3, :3])
         self.homo_goal = homo_goal
 
+    def control_data_is_fresh(self):
+        if self.max_data_age == 0.0:
+            return True
+        now = time.monotonic()
+        return all(
+            stamp is not None and now - stamp <= self.max_data_age
+            for stamp in (self.last_rgbd_at, self.last_odom_at, self.last_plan_at)
+        )
+
     def move(self, vx, vy, vyaw):
+        if not self.control_data_is_fresh():
+            vx = vyaw = 0.0
         request = Twist()
         request.linear.x = vx
         request.linear.y = 0.0
@@ -348,8 +402,9 @@ if __name__ == '__main__':
     planning_thread_instance.daemon = True
     rclpy.init()
 
+    manager = None
     try:
-        manager = Go2Manager()
+        manager = NavigationClient()
 
         control_thread_instance.start()
         planning_thread_instance.start()
@@ -358,5 +413,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     finally:
-        manager.destroy_node()
-        rclpy.shutdown()
+        if manager is not None:
+            manager.destroy_node()
+        rclpy.try_shutdown()

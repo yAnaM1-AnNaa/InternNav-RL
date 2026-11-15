@@ -10,17 +10,19 @@ from PIL import Image
 
 from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
 
-app = Flask(__name__)
+app = Flask(__name__)   # create http application
 idx = 0
 start_time = time.time()
 output_dir = ''
 
 
+# enroll infer port
 @app.route("/eval_dual", methods=['POST'])
 def eval_dual():
     global idx, output_dir, start_time
     start_time = time.time()
 
+    # get robot data
     image_file = request.files['image']
     depth_file = request.files['depth']
     json_data = request.form['json']
@@ -80,17 +82,26 @@ def eval_dual():
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
+    modelscope_cache = os.environ["MODELSCOPE_CACHE"]
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1")
+    parser.add_argument("--model_path", type=str, default="{modelscope_cache}/InternVLA-N1")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument("--plan_step_gap", type=int, default=4) # larger setp_gap, lower VLM frequency
+    parser.add_argument("--port", type=int, default=5801)
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
-        [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        [[386.5, 0.0, 328.9, 0.0], 
+         [0.0, 386.5, 244, 0.0], 
+         [0.0, 0.0, 1.0, 0.0], 
+         [0.0, 0.0, 0.0, 1.0]]
     )
+
+    # create the agent
     agent = InternVLAN1AsyncAgent(args)
+    # use an all zero map to warmup the model, then reset
     agent.step(
         np.zeros((480, 640, 3)),
         np.zeros((480, 640)),
@@ -99,4 +110,4 @@ if __name__ == '__main__':
     )
     agent.reset()
 
-    app.run(host='0.0.0.0', port=5801)
+    app.run(host='0.0.0.0', port=args.port)

@@ -1,6 +1,32 @@
-<div align="center">
+# InternNav-RL
 
-[![demo](assets/InternNav.gif "demo")](https://www.youtube.com/watch?v=fD0F1jIax5Y)
+## To Do
+
++ [ ] Zero-FiLM layer
++ [ ] RL policy
+  + [ ] PPO
+  + [ ] FPO
++ [ ] Build new Isaac Sim playground, with moving obstacles
++ [ ] Train the RL policy in new env
++ [ ] Eval in Isaac Sim
++ [ ] Deploy in real world
++ [ ] *optional* modify InternNav-deploy and deploy the model on Agile Bunker.
+
+## What's new
+
+### FiLM conditioning
+
+ 使用FiLM对DiT的输出轨迹进行调制。
+
+
+
+
+
+
+
+
+
+# Original readme
 
 [![HomePage](https://img.shields.io/badge/HomePage-144B9E?logo=ReactOS&logoColor=white)](https://internrobotics.github.io/internvla-n1.github.io/)
 [![Technical Report — InternVLA-N1](https://img.shields.io/badge/Technical_Report-InternVLA--N1-BB2649?logo=adobeacrobatreader&logoColor=white)](https://internrobotics.github.io/internvla-n1.github.io/static/pdfs/InternVLA_N1.pdf)

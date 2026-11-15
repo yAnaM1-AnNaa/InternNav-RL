@@ -27,7 +27,7 @@ class InternVLAN1AsyncAgent:
     def __init__(self, args):
         self.device = torch.device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        print(f"args.model_path{args.model_path}")
+        print(f"args.model_path: {args.model_path}")
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             args.model_path,
             torch_dtype=torch.bfloat16,
@@ -124,6 +124,7 @@ class InternVLAN1AsyncAgent:
         angular_vel = np.clip(angular_vel, -0.5, 0.5)
         return linear_vel, angular_vel
 
+    # 一次 HTTP 请求内的调度入口
     def step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
         dual_sys_output = S2Output()
         no_output_flag = self.output_action is None and self.output_latent is None
@@ -236,7 +237,8 @@ class InternVLAN1AsyncAgent:
         with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
-        self.past_key_values = copy.deepcopy(outputs.past_key_values)
+        # past_key_values is not passed to generate(), so this cache is never reused; skip it to save GPU memory.
+        # self.past_key_values = copy.deepcopy(outputs.past_key_values)
         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
         if bool(re.search(r'\d', self.llm_output)):
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
