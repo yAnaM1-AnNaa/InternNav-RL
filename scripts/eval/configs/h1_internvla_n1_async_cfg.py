@@ -50,6 +50,8 @@ eval_cfg = EvalCfg(
             'use_distributed': False,  # If the others setting in task_settings, please set use_distributed = False.
             'proc_num': 1,
             'max_step': 1000,  # If use flash mode，default 1000; descrete mode, set 50000
+            # MP3D scene USDs hardcode /isaac-sim/Matterport3D/... texture paths; remap to the local scenes.
+            'scene_texture_root': '/root/rivermind-data/datasets/internnav/scene_data/mp3d_pe',
         },
         scene=SceneCfg(
             scene_type='mp3d',

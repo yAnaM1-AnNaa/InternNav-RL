@@ -3,6 +3,12 @@ import sys
 sys.path.append('.')
 sys.path.append('./third_party/diffusion-policy')
 
+# Bootstrap the Isaac Sim / Omniverse Kit kernel first, so that `carb`/`omni`
+# are importable when InternUtopia's import_extensions() runs below. In the
+# official NGC container this is done by `source python.env.init`; the pip
+# install needs an explicit import. Requires OMNI_KIT_ACCEPT_EULA=YES.
+import isaacsim  # noqa: F401
+
 import argparse
 import importlib.util
 from pathlib import Path

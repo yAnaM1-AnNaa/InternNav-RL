@@ -1,3 +1,5 @@
+import os
+
 from internutopia.core.task import BaseTask
 
 from internnav.evaluator.utils.common import set_seed
@@ -60,6 +62,23 @@ class VLNEvalTask(BaseTask):
         self.down_disk_light_position = UsdGeom.Xformable(self.down_disk_light).AddTranslateOp()
         self.down_disk_light_position.Set(Gf.Vec3f(*self.env_offset))
 
+    def fix_scene_textures(self):
+        if self.config.scene_texture_root is None:
+            return
+        from pxr import Sdf, Usd, UsdShade
+
+        for prim in Usd.PrimRange(self._scene.scene_prim):
+            if not prim.IsA(UsdShade.Material):
+                continue
+            shaders = [p for p in Usd.PrimRange(prim) if p.IsA(UsdShade.Shader)]
+            tex_input = UsdShade.Shader(shaders[0]).GetInput('diffuse_texture') if shaders else None
+            if not tex_input or not tex_input.Get():
+                continue
+            tex_path = tex_input.Get().path
+            if '/scans/' in tex_path:
+                tex_path = os.path.join(self.config.scene_texture_root, tex_path.split('/scans/', 1)[1])
+                tex_input.Set(Sdf.AssetPath(tex_path))
+
     def reset_light_position(self, position):
         from pxr import Gf
 
@@ -78,6 +97,7 @@ class VLNEvalTask(BaseTask):
         super().load()
         self.robot_name = list(self.robots.keys())[0]
         self.create_light()
+        self.fix_scene_textures()
         self.done_checker = DoneChecker(
             self.env_offset,
             self.robots[list(self.robots.keys())[0]],

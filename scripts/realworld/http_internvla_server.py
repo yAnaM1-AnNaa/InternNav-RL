@@ -73,7 +73,7 @@ def main():
     parser.add_argument('--num_history', type=int, default=8)
     parser.add_argument('--plan_step_gap', type=int, default=4)
     parser.add_argument('--port', type=int, default=5801)
-    parser.add_argument('--instruction_file', type=Path, default='rivermind-data/InternNav-RL/scripts/realworld/instructions.yaml')
+    parser.add_argument('--instruction_file', type=Path, default='/root/rivermind-data/InternNav-RL/scripts/realworld/instructions.yaml')
     parser.add_argument('--task_name', help='Task in the YAML; defaults to the first one', default='find the trash bin')
     args = parser.parse_args()
 

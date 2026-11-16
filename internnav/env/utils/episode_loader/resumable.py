@@ -51,8 +51,14 @@ class ResumablePathKeyEpisodeloader(BasePathKeyEpisodeloader):
             lock=True,
         )
 
+        # Episodes that repeatedly hung Isaac Sim (written by the eval watchdog), one path_key per line.
+        skip_file = os.environ.get('INTERNNAV_SKIP_EPISODES')
+        skipped = set(open(skip_file).read().split()) if skip_file and os.path.exists(skip_file) else set()
+
         filtered_target_path_key_list = []
         for path_key in self.path_key_data.keys():
+            if path_key in skipped:
+                continue
             # trajectory_id = int(path_key.split('_')[0])
             with database.begin() as txn:
                 value = txn.get(path_key.encode())

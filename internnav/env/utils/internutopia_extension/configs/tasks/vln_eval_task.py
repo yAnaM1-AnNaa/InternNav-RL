@@ -15,3 +15,6 @@ class VLNEvalTaskCfg(TaskCfg):
     data: Dict
     robot_flash: Optional[bool] = False
     one_step_stand_still: Optional[bool] = False
+    # Local dir replacing the `.../scans` prefix baked into MP3D scene USD texture paths
+    # (the official assets point at `/isaac-sim/Matterport3D/data/v1/scans`).
+    scene_texture_root: Optional[str] = None

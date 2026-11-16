@@ -20,11 +20,41 @@
 
 
 
+## Usage
+### eval
 
+Isaac Sim VLN-PE eval (val_unseen, `internnav-ms` env), run through a watchdog.
+Isaac Sim 4.5 occasionally hangs while rendering; when the log is idle for 900 s the watchdog
+restarts the eval from the unfinished episode, and skips an episode that hangs twice.
 
+Foreground (in a terminal or tmux; Ctrl+C stops the watchdog and the eval):
 
+```bash
+cd /root/rivermind-data/InternNav-RL
+bash /root/rivermind-data/tools/eval_watchdog_rl.sh \
+  scripts/eval/configs/h1_internvla_n1_async_cfg.py test_n1 900
+```
 
+Background (keeps running after the terminal closes):
 
+```bash
+cd /root/rivermind-data/InternNav-RL
+mkdir -p logs/test_n1
+setsid nohup /root/rivermind-data/tools/eval_watchdog_rl.sh \
+  scripts/eval/configs/h1_internvla_n1_async_cfg.py test_n1 900 \
+  > logs/test_n1/watchdog_stdout.log 2>&1 < /dev/null &
+```
+
+Monitor and stop:
+
+```bash
+tail -f logs/test_n1/progress/test_n1.log    # per-episode progress
+cat logs/test_n1/watchdog.log                 # restarts / skipped episodes
+kill $(cat logs/test_n1/watchdog.pid)         # stop (also stops the eval)
+```
+
+Results are in `logs/test_n1/result.json`; skipped episodes in `logs/test_n1/skipped_episodes.txt`.
+Running the same command again resumes from the finished episodes.
 
 # Original readme
 

@@ -28,7 +28,5 @@ find the trash bin:
   total_time: 300
   instructions:
     find_the_bin: >-
-      Turn around and find the rubbish bin. If the rubbish bin is not visible, turn around again.
-      If the bin is still not visible, move to the nearest path. Follow the path and seek for the bin.
-    move_to_the_bin: >-
-      Move forward to the bin. Avoid obstacles.
+      Turn around and find the dark green rubbish bin. If the rubbish bin is not visible, turn around again. After you have located the bin, move forward to the bin, and stop in front of the bin. Leave at least 20 centimeters in front of the bin. Avoid obstacles.
+      
