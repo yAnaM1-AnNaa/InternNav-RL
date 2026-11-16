@@ -1,0 +1,148 @@
+########## On server ##########
+### conda env ###
+conda create -n internnav python=3.10 libxcb=1.14
+conda activate internnav
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 
+pip install -e .[model, isaac] --no-build-isolation 	# must contain [], install dependencies for the Isaac environment.
+# pip install -e .[habitat] --no-build-isolation
+
+### checkpoint ###
+pip install modelscope
+modelscope download --model InternRobotics/InternVLA-N1-DualVLN  # make sure u have changed the modelscope_cache
+modelscope download --model litert-community/Depth-Anything-V2-Metric-Hypersim-Small
+mkdir -p InternNav/checkpoints
+ln -s $MODELSCOPE_CACHE/hub/models/InternRobotics/InternVLA-N1-DualVLN \
+        InternNav/checkpoints/InternVLA-N1-DualVLN
+ln -s $MODELSCOPE_CACHE/hub/models/litert-community/Depth-Anything-V2-Metric-Hypersim-Small/de
+  pth_anything_v2_metric_hypersim_vits.pth \
+        InternNav/checkpoints/
+        
+### verification ###
+cd InternNav
+python scripts/eval/start_server.py --port 8087
+
+
+
+########## On GO2 ##########
+### SSH to GO2 ###
+git clone https://github.com/cmjang/InternNav-deploy.git
+git clone https://github.com/yAnaM1-AnNaa/InternNav-RL.git
+### if uv is not installed ###
+cd InternNav-deploy
+curl -LsSf https://astral.sh/uv/install.sh | sh  # install uv
+uv venv --python 3.10 		 	# create uv env
+source internnav/bin/activate 		# activate uv env
+uv pip install numpy requests Pillow casadi
+cd onboard
+chmod +x start_robot.sh
+
+### Unitree SDK ###
+cd ..
+git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
+cd unitree_sdk2_python
+uv pip install -e .			# install unitree sdk
+
+### Realsense camera ###
+cd InternNav-deploy
+uv pip install pyrealsense2
+# 添加 RealSense 公钥
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-key F6E65AC044F831AC80A06380C8B3A55A6F3EFCDE || \
+sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-key F6E65AC044F831AC80A06380C8B3A55A6F3EFCDE
+# 添加软件源
+sudo add-apt-repository "deb https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" -u
+# 安装库和工具
+sudo apt-get install librealsense2-utils librealsense2-dev
+
+### port ###
+ROBOT_IF="eth0"  # 根据实际网卡名称修改，如 enp3s0、wlan0 等
+cd InternNav-deploy
+./start_robot.sh
+
+
+########## On AgileX bunker ##########
+### SSH to the Bunker onboard PC ###
+# Ubuntu 22.04 + ROS 2 Humble; install Humble first if /opt/ros/humble is missing.
+# https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html
+# Ubuntu 24.04 + ROS 2 Jazzy 时把下一行改成 ROS_DISTRO=jazzy，其余命令不变。
+ROS_DISTRO=humble  # 每个新终端都要先设置
+cd ~
+git clone https://github.com/yAnaM1-AnNaa/InternNav-RL.git  # skip if already cloned
+cd ~/InternNav-RL
+ls deploy/bunker/start_robot.sh  # use the checkout that contains deploy/bunker
+
+### AgileX SDK + ROS2 driver ###
+source /opt/ros/$ROS_DISTRO/setup.bash
+sudo apt update
+sudo apt install build-essential cmake git libasio-dev can-utils \
+    python3-colcon-common-extensions ros-$ROS_DISTRO-ros-base ros-$ROS_DISTRO-tf2-geometry-msgs \
+    ros-$ROS_DISTRO-cv-bridge ros-$ROS_DISTRO-message-filters
+
+mkdir -p ~/bunker_ws/src
+cd ~/bunker_ws
+git clone --depth 1 --branch main https://github.com/agilexrobotics/ugv_sdk.git ugv_sdk
+git clone --depth 1 --branch humble https://github.com/agilexrobotics/bunker_ros2.git src/bunker_ros2
+# humble 是驱动仓库的分支名；Jazzy 也用这个分支从源码编译。
+cmake -S ugv_sdk -B sdk_build -DCMAKE_INSTALL_PREFIX="$PWD/sdk_install"
+cmake --build sdk_build -j2
+cmake --install sdk_build
+colcon build --base-paths src --packages-up-to bunker_base \
+    --cmake-args -Dugv_sdk_DIR="$PWD/sdk_install/lib/cmake/ugv_sdk" -DBUILD_TESTING=OFF
+source install/setup.bash
+ros2 pkg executables bunker_base  # should show bunker_base_node
+
+### uv env + RealSense ###
+cd ~/InternNav-RL
+# curl -LsSf https://astral.sh/uv/install.sh | sh  # only if uv is missing
+uv venv --python /usr/bin/python3 --system-site-packages  # 必须用系统 Python：Humble 为 3.10，Jazzy 为 3.12
+source .venv/bin/activate
+uv pip install "numpy<2" requests Pillow scipy casadi pyrealsense2
+python -c "import rclpy, cv_bridge, message_filters, pyrealsense2, casadi; print('imports OK')"
+bash deploy/bunker/start_robot.sh --show-args  # 只查看参数，不启动底盘或相机
+
+### CAN ###
+# 连接底盘和 USB-CAN 后执行。用 ip -br link 确认接口名；下文以 can0 为例。
+sudo modprobe gs_usb  # if your USB-CAN adapter uses gs_usb
+ip -br link
+sudo ip link set can0 up type can bitrate 500000  # 若已 UP，先设为 down 再配置
+ip -details link show can0
+candump can0  # 只读检查：看到 CAN 帧后按 Ctrl+C
+
+### Start robot on Bunker ###
+# Terminal A: 新终端需要先 source ROS、bunker_ws 和 .venv。
+cd ~/InternNav-RL
+ROS_DISTRO=humble
+source /opt/ros/$ROS_DISTRO/setup.bash
+source ~/bunker_ws/install/setup.bash
+source .venv/bin/activate
+bash deploy/bunker/start_robot.sh can_interface:=can0 camera_python:="$VIRTUAL_ENV/bin/python"
+# Bunker Mini 可在命令末尾加 is_bunker_mini:=true。
+
+### Check topics before starting the client ###
+# Terminal B: open a new terminal, use the same ROS_DOMAIN_ID as Terminal A.
+cd ~/InternNav-RL
+ROS_DISTRO=humble  # 与 Terminal A 相同
+source /opt/ros/$ROS_DISTRO/setup.bash
+source ~/bunker_ws/install/setup.bash
+source .venv/bin/activate
+ros2 topic hz /odom_bridge  # 观察几秒后按 Ctrl+C；下同
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+# 云端 HTTP server 就绪后，在这个终端启动客户端，把地址换成实际的完整 URL。
+INTERNNAV_SERVER_URL='http://SERVER_IP:5801/eval_dual'
+python scripts/realworld/http_internvla_client.py --ros-args \
+    -p server_url:="$INTERNNAV_SERVER_URL" -p max_data_age:=2.0
+
+
+########## Start deploy ##########
+### Start http_server on remote server###
+cd InternNav
+# in scripts/realworld/http_internvla_client.py
+# url='http://127.0.0.1:5801/eval_dual'  # 将 127.0.0.1 替换为推理服务器的实际 IP, 5801 to real port
+python3 scripts/realworld/http_internvla_server.py \
+	--port 5801
+
+### Start http_client and ROS2 on local robot ###
+python3 scripts/realworld/http_internvla_cliet.py --ros-args\
+	-p server_url:=http://<服务器公网IP>:<port>/eval_dual
+bash start_client.sh
+
