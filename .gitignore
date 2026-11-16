@@ -152,3 +152,6 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+data/*
+!data/eval_instructions.yaml
+test_data/
