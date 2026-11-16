@@ -1,0 +1,34 @@
+# Ordered multi-instruction tasks for the real-world HTTP server.
+#
+# Top-level keys are task names. Select one with --task_name; if omitted, the
+# first task in this file is used.
+#
+# Each task has:
+#   total_time:   optional total budget in seconds for the whole task. The remaining
+#                 time is split evenly across the remaining instructions, so every
+#                 part gets a chance to run. Omit it to advance on STOP only.
+#   instructions: ordered mapping key -> instruction text. YAML order is the
+#                 execution order of the parts.
+
+walk around the office:
+  total_time: 600
+  instructions:
+    office_to_monitor: >-
+      Turn around and walk out of this office. Turn towards your slight right at the chair.
+      Move forward to the walkway and go near the red bin. You can see an open door on your right side,
+      go inside the open door. Stop at the computer monitor.
+
+    lab_to_exit: >-
+      Walk past the lab benches and turn left at the fire extinguisher.
+      Continue to the end of the corridor and stop in front of the exit door.
+
+    hallway_forward: "Move forward along the hallway and stop before the glass door."
+
+find the trash bin:
+  total_time: 300
+  instructions:
+    find_the_bin: >-
+      Turn around and find the rubbish bin. If the rubbish bin is not visible, turn around again.
+      If the bin is still not visible, move to the nearest path. Follow the path and seek for the bin.
+    move_to_the_bin: >-
+      Move forward to the bin. Avoid obstacles.
